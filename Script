@@ -1,0 +1,452 @@
+--// PATCHED BY CHATGPT: SCRIPT 2 RAW MAP IN-TRACK PLAYBACK + RAW STATE FIX
+--// PATCHED: VIP PRIVATE GUNUNG LIST (per-key Google Drive links)
+
+--// PATCH BY CHATGPT: LIGHT MODE + NO GRAY TOOL FIX
+--// - FPS Boost tidak menghapus texture Tool/Coil/Avatar.
+--// - Path visualizer dibuat ringan dan auto-hide saat Play.
+--// - Hard remove grass dimatikan agar HP/Delta tidak spike/patah-patah.
+--// PATCHED: MOBILE FLOATING PLAY/STOP MULTI-TOUCH SAFE / ANTI ANALOG DRAG
+-- ========== KEY SYSTEM CONFIGURATION ==========
+local API_BASE_URL  = "https://kingstrom.my.id"
+local FREE_KEY      = "FREE-ACCESS-2026"
+local SCRIPT_NAME   = "race"
+
+local KEY_STORAGE_NAME = "KACUNG MARVKeyStorage_V17"
+local KEY_FILE_NAME    = "KACUNG MARV_key.json"
+
+local GUNUNG_API_URL = API_BASE_URL .. "/gunung_api.php?action=list"
+local PRIVATE_GUNUNG_API_URL = API_BASE_URL .. "/private_gunung_api.php"
+
+-- ========== LOAD WINDUI ==========
+local WindUI = loadstring(game:HttpGet(
+    "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"
+))()
+
+-- ========== SERVICES ==========
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local HttpService       = game:GetService("HttpService")
+local TweenService      = game:GetService("TweenService")
+local Workspace         = game:GetService("Workspace")
+local GuiService        = game:GetService("GuiService")
+local SoundService      = game:GetService("SoundService")
+local RbxAnalyticsService = game:GetService("RbxAnalyticsService")
+
+local player = Players.LocalPlayer
+
+-- ========== CONFIG ==========
+local SAMPLE_INTERVAL        = 0.04
+local MIN_PLAYBACK_SPEED     = 8
+local MAX_PLAYBACK_SPEED     = 500
+local DEFAULT_PLAYBACK_SPEED = 16
+local TELEPORT_THRESHOLD     = 200
+local RESUME_DISTANCE_THRESHOLD = 200
+
+-- PATCH: Kalau player jauh dari route, jangan TP ke start.
+-- Player akan lari ke titik route terdekat pakai speed map lalu playback langsung jalan.
+AUTO_RUN_TO_ROUTE_ENABLED = true
+AUTO_RUN_TO_ROUTE_STOP_DISTANCE = 3.5
+AUTO_RUN_TO_ROUTE_MAX_TIME = 12
+AUTO_RUN_TO_ROUTE_MIN_SPEED = 16
+AUTO_RUN_TO_ROUTE_MAX_SPEED = 500
+
+-- PATCH ANTI BOLAK-BALIK SAAT MASUK TRACK:
+-- Target auto-run dibuat sedikit maju dari titik terdekat, diberi toleransi,
+-- dan kalau avatar sudah melewati target / stuck, playback langsung lanjut dari titik route terdekat.
+AUTO_RUN_TO_ROUTE_LOOKAHEAD_FRAMES = 8
+AUTO_RUN_TO_ROUTE_ACCEPT_MULTIPLIER = 1.65
+AUTO_RUN_TO_ROUTE_OVERSHOOT_MULTIPLIER = 2.4
+AUTO_RUN_TO_ROUTE_STUCK_SECONDS = 0.85
+AUTO_RUN_TO_ROUTE_STUCK_MIN_MOVE = 0.75
+AUTO_RUN_TO_ROUTE_RETARGET_SECONDS = 0.35
+
+-- PATCH PLAY FINISH:
+-- Kalau route sudah selesai dan avatar masih di area finish/marker merah, klik Play lagi harus ulang dari START.
+-- Kalau avatar sudah jauh dari finish, jangan paksa start; tetap pakai titik route terdekat.
+PLAY_FINISH_RESTART_DISTANCE = 18
+PLAY_FINISH_RESTART_TIME_WINDOW = 0.35
+
+-- PATCH LOOP SPEED:
+-- Speed dikunci per sesi play supaya mode loop tidak menggandakan multiplier/velocity.
+LOOP_SPEED_MULTIPLIER_MIN = 0.1
+-- PATCH STABLE SPEED: max multiplier diturunkan supaya input speed tidak bikin playback dobel kenceng/macat.
+LOOP_SPEED_MULTIPLIER_MAX = 50
+
+-- PATCH STABLE SPEED / ANTI MACET
+-- Jangan biarkan WalkSpeed/velocity runtime ikut angka rusak/terlalu besar.
+-- Speed setting tetap live, tapi dibatasi agar tidak dobel kenceng dan avatar tidak ketarik/macat.
+KACUNG_MARV_STABLE_MAX_PLAY_SPEED = 500
+KACUNG_MARV_STABLE_MAX_RESTORE_SPEED = MAX_PLAYBACK_SPEED -- restore map/coil speed asli, bukan dibatasi 120
+KACUNG_MARV_STABLE_MAX_AIR_HSPEED = 500
+KACUNG_MARV_STABLE_MAX_RUN_HSPEED = 500
+KACUNG_MARV_STABLE_MAX_YSPEED = 220
+
+-- ========== KEY SYSTEM VARIABLES ==========
+local userLevel    = "none"
+local validatedKey = nil
+local deviceId     = nil
+local apiConnected = false
+local remainingDays = 0
+
+-- ========== PLAYBACK VARIABLES ==========
+local isRecording            = false
+local recordedFrames         = {}
+local recordStartTick        = 0
+local sampleAcc              = 0
+local currentRecordTime      = 0
+
+local playbackActive         = false
+local playbackConnection     = nil
+
+-- Animasi climbing / naik tangga saat playback
+local activeClimbTrack       = nil
+local activeClimbHumanoid    = nil
+
+local currentPlaybackSpeed   = DEFAULT_PLAYBACK_SPEED
+-- PATCH LIVE SPEED: nilai runtime ini dipakai Heartbeat playback, jadi speed bisa berubah saat Play masih aktif.
+local playbackRuntimeSpeed  = DEFAULT_PLAYBACK_SPEED
+local originalRecordingSpeed = DEFAULT_PLAYBACK_SPEED
+
+-- FIX: Variabel untuk menyimpan state karakter SEBELUM playback dimulai
+local savedWalkSpeed         = 16
+local savedJumpPower         = 50
+local savedJumpHeight        = 7.2
+local savedUseJumpPower      = true
+local savedAutoRotate        = true
+
+-- PATCH PLAY -> STOP CLEAN STATE:
+-- Stop manual jangan dianggap finish, dan Stop harus bisa membatalkan fase auto-run menuju route.
+local playbackStopRequested  = false
+local autoRunToRouteActive   = false
+
+-- ========== PLAY/STOP SPAM GUARD ==========
+-- Global tanpa local banyak-banyak supaya aman dari limit register executor.
+PLAYSTOP_ACTION_BUSY = false
+PLAYSTOP_LOCK_UNTIL = 0
+PLAYSTOP_RESTART_COOLDOWN = 0.45
+PLAYSTOP_TAP_COOLDOWN = 0.42
+PLAYSTOP_LAST_NOTICE_CLOCK = 0
+OUTSIDE_PLAYSTOP_LAST_TAP_CLOCK = 0
+
+local currentPlaybackTime    = 0
+local totalPlaybackDuration  = 0
+local lastPlaybackFrameIndex = 1
+local playbackPaused         = false
+local lastKnownPosition      = nil
+local lastKnownPlaybackTime  = 0
+local playbackFinished       = false
+local isLoopMode             = false
+
+local pathRecordActive = false
+local pathRecordParts  = {}
+local pathRecordBeams  = {}
+
+local speedometerActive    = false
+local speedometerConnection = nil
+local currentPlayerSpeed   = 0
+
+-- Timer UI Elements
+local timerGui        = nil
+local timerFrame      = nil
+local timerLabel      = nil
+local timerTextLabel  = nil
+local recordIndicator = nil
+local frameCountLabel = nil
+
+-- WindUI Window reference
+local Window = nil
+
+local showNotification
+
+-- Settings
+local uiSettings = {
+    theme       = "Dark",
+    accentColor = Color3.fromRGB(200, 150, 255),
+    transparency = 0.02,
+    fontSize    = "Medium",
+    showOutsidePlayStop = false,
+    playHotkey = "P",
+    stopHotkey = "X",
+    minimizeHotkey = "M",
+    fpsBoostActive = false,
+    clickSoundEnabled = true,
+    clickSoundVolume = 0.55,
+}
+
+-- ========== UI SETTINGS SAVE SYSTEM ==========
+local UI_SETTINGS_STORAGE_NAME = "KACUNG_MARV_UI_SETTINGS_V25"
+local UI_SETTINGS_FILE_NAME    = "KACUNG_MARV_ui_settings.json"
+
+local function sanitizeThemeName(theme)
+    theme = tostring(theme or "Dark")
+    local allowed = {
+        Dark = true, Light = true, Rose = true, Violet = true, Amber = true,
+        Red = true, Blue = true, Green = true, Cyan = true, Purple = true, Pink = true,
+    }
+    if allowed[theme] then
+        return theme
+    end
+    return "Dark"
+end
+
+function sanitizeHotkeyText(value, fallback)
+    -- Kalau data lama belum punya hotkey, pakai default/fallback.
+    if value == nil then
+        value = fallback
+    end
+
+    value = tostring(value or "")
+    value = value:gsub("^%s+", ""):gsub("%s+$", "")
+    value = value:upper()
+
+    -- Kosong = hotkey dimatikan.
+    if value == "" or value == "NONE" or value == "OFF" or value == "-" then
+        return ""
+    end
+
+    -- Ambil 1 karakter pertama saja sesuai request: contoh P untuk Play, X untuk Stop.
+    local oneChar = value:match("[A-Z0-9]")
+    if oneChar then
+        return oneChar
+    end
+
+    fallback = tostring(fallback or ""):upper()
+    return fallback:match("[A-Z0-9]") or ""
+end
+
+local function loadUiSettings()
+    local data = nil
+
+    if type(_G[UI_SETTINGS_STORAGE_NAME]) == "table" then
+        data = _G[UI_SETTINGS_STORAGE_NAME]
+    else
+        pcall(function()
+            if readfile and isfile and isfile(UI_SETTINGS_FILE_NAME) then
+                data = HttpService:JSONDecode(readfile(UI_SETTINGS_FILE_NAME))
+            end
+        end)
+    end
+
+    if type(data) == "table" then
+        uiSettings.theme = sanitizeThemeName(data.theme or uiSettings.theme)
+        uiSettings.showOutsidePlayStop = data.showOutsidePlayStop == true
+        uiSettings.playHotkey = sanitizeHotkeyText(data.playHotkey, uiSettings.playHotkey or "P")
+        uiSettings.stopHotkey = sanitizeHotkeyText(data.stopHotkey, uiSettings.stopHotkey or "X")
+        uiSettings.minimizeHotkey = sanitizeHotkeyText(data.minimizeHotkey, uiSettings.minimizeHotkey or "M")
+        if uiSettings.playHotkey ~= "" and uiSettings.playHotkey == uiSettings.stopHotkey then
+            uiSettings.stopHotkey = "X"
+            if uiSettings.playHotkey == uiSettings.stopHotkey then
+                uiSettings.stopHotkey = ""
+            end
+        end
+        if uiSettings.minimizeHotkey ~= "" then
+            if uiSettings.minimizeHotkey == uiSettings.playHotkey or uiSettings.minimizeHotkey == uiSettings.stopHotkey then
+                uiSettings.minimizeHotkey = "M"
+                if uiSettings.minimizeHotkey == uiSettings.playHotkey or uiSettings.minimizeHotkey == uiSettings.stopHotkey then
+                    uiSettings.minimizeHotkey = ""
+                end
+            end
+        end
+        uiSettings.clickSoundEnabled = data.clickSoundEnabled ~= false
+        uiSettings.clickSoundVolume = tonumber(data.clickSoundVolume) or uiSettings.clickSoundVolume
+        uiSettings.clickSoundVolume = math.max(0, math.min(2, uiSettings.clickSoundVolume))
+        -- FPS Boost jangan ikut auto hidup dari save lama. Harus dinyalakan manual dari menu setiap inject/login.
+        uiSettings.fpsBoostActive = false
+    else
+        uiSettings.theme = sanitizeThemeName(uiSettings.theme)
+        uiSettings.playHotkey = sanitizeHotkeyText(uiSettings.playHotkey, "P")
+        uiSettings.stopHotkey = sanitizeHotkeyText(uiSettings.stopHotkey, "X")
+        uiSettings.minimizeHotkey = sanitizeHotkeyText(uiSettings.minimizeHotkey, "M")
+    end
+
+    _G[UI_SETTINGS_STORAGE_NAME] = {
+        theme = uiSettings.theme,
+        showOutsidePlayStop = uiSettings.showOutsidePlayStop == true,
+        playHotkey = sanitizeHotkeyText(uiSettings.playHotkey, "P"),
+        stopHotkey = sanitizeHotkeyText(uiSettings.stopHotkey, "X"),
+        minimizeHotkey = sanitizeHotkeyText(uiSettings.minimizeHotkey, "M"),
+        clickSoundEnabled = uiSettings.clickSoundEnabled ~= false,
+        clickSoundVolume = tonumber(uiSettings.clickSoundVolume) or 0.55,
+        -- Jangan simpan ON untuk auto start. Default FPS Boost selalu OFF saat script dibuka.
+        fpsBoostActive = false,
+    }
+end
+
+local function saveUiSettings(silent)
+    local saveData = {
+        theme = sanitizeThemeName(uiSettings.theme),
+        showOutsidePlayStop = uiSettings.showOutsidePlayStop == true,
+        playHotkey = sanitizeHotkeyText(uiSettings.playHotkey, "P"),
+        stopHotkey = sanitizeHotkeyText(uiSettings.stopHotkey, "X"),
+        minimizeHotkey = sanitizeHotkeyText(uiSettings.minimizeHotkey, "M"),
+        clickSoundEnabled = uiSettings.clickSoundEnabled ~= false,
+        clickSoundVolume = tonumber(uiSettings.clickSoundVolume) or 0.55,
+        -- FPS Boost tidak dibuat auto ON saat login berikutnya. Toggle tetap bisa ON/OFF dari menu.
+        fpsBoostActive = false,
+        savedAt = os.time(),
+    }
+
+    _G[UI_SETTINGS_STORAGE_NAME] = saveData
+
+    pcall(function()
+        if writefile then
+            writefile(UI_SETTINGS_FILE_NAME, HttpService:JSONEncode(saveData))
+        end
+    end)
+
+    if not silent and type(showNotification) == "function" then
+        showNotification("Settings", "💾 Setting UI disimpan", 1)
+    end
+end
+
+loadUiSettings()
+
+-- ========== WINDUI PANELBACKGROUND NIL FIX ==========
+-- Error yang muncul: attempt to index nil with 'PanelBackground'.
+-- Penyebabnya biasanya theme WindUI belum siap / theme custom tidak punya key baru.
+-- Patch ini membuat theme aman sebelum CreateWindow dan retry otomatis pakai Dark.
+WINDUI_SAFE_THEME_NAME = "Dark"
+
+function windUIThemePalette(themeName)
+    themeName = sanitizeThemeName(themeName or "Dark")
+
+    local palettes = {
+        Dark   = { Accent = Color3.fromRGB(200,150,255), Background = Color3.fromRGB(18,18,22), Panel = Color3.fromRGB(24,24,30), Button = Color3.fromRGB(42,38,52), Outline = Color3.fromRGB(82,72,105), Text = Color3.fromRGB(255,255,255), Placeholder = Color3.fromRGB(170,170,185), Icon = Color3.fromRGB(210,170,255) },
+        Light  = { Accent = Color3.fromRGB(120,90,220),  Background = Color3.fromRGB(245,245,250), Panel = Color3.fromRGB(255,255,255), Button = Color3.fromRGB(232,230,242), Outline = Color3.fromRGB(190,185,215), Text = Color3.fromRGB(20,20,24),    Placeholder = Color3.fromRGB(105,105,125), Icon = Color3.fromRGB(120,90,220) },
+        Rose   = { Accent = Color3.fromRGB(235,95,145),  Background = Color3.fromRGB(35,14,24),   Panel = Color3.fromRGB(44,18,30),   Button = Color3.fromRGB(95,35,58),    Outline = Color3.fromRGB(255,130,175), Text = Color3.fromRGB(255,255,255), Placeholder = Color3.fromRGB(220,160,185), Icon = Color3.fromRGB(255,145,190) },
+        Violet = { Accent = Color3.fromRGB(165,105,255), Background = Color3.fromRGB(24,14,40),   Panel = Color3.fromRGB(31,18,52),   Button = Color3.fromRGB(70,45,125),   Outline = Color3.fromRGB(195,145,255), Text = Color3.fromRGB(255,255,255), Placeholder = Color3.fromRGB(190,165,220), Icon = Color3.fromRGB(210,170,255) },
+        Amber  = { Accent = Color3.fromRGB(255,185,70),  Background = Color3.fromRGB(35,24,10),   Panel = Color3.fromRGB(45,31,13),   Button = Color3.fromRGB(95,65,22),    Outline = Color3.fromRGB(255,205,95),  Text = Color3.fromRGB(255,255,255), Placeholder = Color3.fromRGB(225,195,145), Icon = Color3.fromRGB(255,215,110) },
+        Red    = { Accent = Color3.fromRGB(180,40,50),   Background = Color3.fromRGB(25,10,12),   Panel = Color3.fromRGB(34,14,17),   Button = Color3.fromRGB(120,35,45),   Outline = Color3.fromRGB(255,90,100), Text = Color3.fromRGB(255,255,255), Placeholder = Color3.fromRGB(200,150,150), Icon = Color3.fromRGB(255,120,130) },
+        Blue   = { Accent = Color3.fromRGB(40,100,220),  Background = Color3.fromRGB(10,15,30),   Panel = Color3.fromRGB(14,22,44),   Button = Color3.fromRGB(35,70,150),   Outline = Color3.fromRGB(90,150,255), Text = Color3.fromRGB(255,255,255), Placeholder = Color3.fromRGB(150,170,220), Icon = Color3.fromRGB(120,170,255) },
+        Green  = { Accent = Color3.fromRGB(40,170,90),   Background = Color3.fromRGB(10,25,15),   Panel = Color3.fromRGB(14,35,21),   Button = Color3.fromRGB(35,110,65),   Outline = Color3.fromRGB(90,255,150), Text = Color3.fromRGB(255,255,255), Placeholder = Color3.fromRGB(150,210,170), Icon = Color3.fromRGB(120,255,160) },
+        Cyan   = { Accent = Color3.fromRGB(40,180,200),  Background = Color3.fromRGB(8,20,25),    Panel = Color3.fromRGB(12,32,38),   Button = Color3.fromRGB(30,110,130),  Outline = Color3.fromRGB(90,230,255), Text = Color3.fromRGB(255,255,255), Placeholder = Color3.fromRGB(150,220,230), Icon = Color3.fromRGB(120,240,255) },
+        Purple = { Accent = Color3.fromRGB(140,70,220),  Background = Color3.fromRGB(18,10,30),   Panel = Color3.fromRGB(26,14,45),   Button = Color3.fromRGB(85,45,150),   Outline = Color3.fromRGB(190,120,255), Text = Color3.fromRGB(255,255,255), Placeholder = Color3.fromRGB(190,160,220), Icon = Color3.fromRGB(210,150,255) },
+        Pink   = { Accent = Color3.fromRGB(220,70,160),  Background = Color3.fromRGB(30,10,22),   Panel = Color3.fromRGB(42,14,30),   Button = Color3.fromRGB(150,45,110),  Outline = Color3.fromRGB(255,120,200), Text = Color3.fromRGB(255,255,255), Placeholder = Color3.fromRGB(220,160,200), Icon = Color3.fromRGB(255,150,210) },
+    }
+
+    return palettes[themeName] or palettes.Dark
+end
+
+function windUIBuildSafeTheme(themeName)
+    themeName = sanitizeThemeName(themeName or "Dark")
+    local p = windUIThemePalette(themeName)
+
+    return {
+        Name = themeName,
+        Accent = p.Accent,
+        Background = p.Background,
+        PanelBackground = p.Panel,
+        Panel = p.Panel,
+        WindowBackground = p.Panel,
+        Topbar = p.Panel,
+        TopbarBackground = p.Panel,
+        TabBackground = p.Panel,
+        Element = p.Button,
+        ElementBackground = p.Button,
+        ElementHover = p.Outline,
+        ElementActive = p.Accent,
+        Button = p.Button,
+        ButtonBackground = p.Button,
+        ButtonHover = p.Outline,
+        ButtonActive = p.Accent,
+        Toggle = p.Accent,
+        ToggleBackground = p.Button,
+        Slider = p.Accent,
+        Dropdown = p.Button,
+        Input = p.Button,
+        Text = p.Text,
+        TextColor = p.Text,
+        SubText = p.Placeholder,
+        Placeholder = p.Placeholder,
+        Icon = p.Icon,
+        Outline = p.Outline,
+        Border = p.Outline,
+        Stroke = p.Outline,
+        Dialog = p.Panel,
+        DialogBackground = p.Panel,
+    }
+end
+
+function windUIFillThemeMissing(targetTheme, fallbackTheme)
+    targetTheme = type(targetTheme) == "table" and targetTheme or {}
+    fallbackTheme = type(fallbackTheme) == "table" and fallbackTheme or windUIBuildSafeTheme("Dark")
+
+    for key, value in pairs(fallbackTheme) do
+        if targetTheme[key] == nil then
+            targetTheme[key] = value
+        end
+    end
+
+    -- Key paling penting untuk WindUI versi baru.
+    targetTheme.PanelBackground = targetTheme.PanelBackground or targetTheme.Panel or targetTheme.Background or fallbackTheme.PanelBackground
+    targetTheme.Background = targetTheme.Background or targetTheme.PanelBackground or fallbackTheme.Background
+    targetTheme.Text = targetTheme.Text or targetTheme.TextColor or fallbackTheme.Text
+    targetTheme.Outline = targetTheme.Outline or targetTheme.Border or targetTheme.Stroke or fallbackTheme.Outline
+    targetTheme.Accent = targetTheme.Accent or fallbackTheme.Accent
+    targetTheme.Button = targetTheme.Button or targetTheme.Element or targetTheme.Background or fallbackTheme.Button
+    targetTheme.Icon = targetTheme.Icon or targetTheme.Accent or fallbackTheme.Icon
+    targetTheme.Placeholder = targetTheme.Placeholder or targetTheme.SubText or fallbackTheme.Placeholder
+
+    return targetTheme
+end
+
+function windUIEnsureTheme(themeName)
+    themeName = sanitizeThemeName(themeName or "Dark")
+    local safeTheme = windUIBuildSafeTheme(themeName)
+    WINDUI_SAFE_THEME_NAME = themeName
+
+    pcall(function()
+        if WindUI and WindUI.AddTheme then
+            WindUI:AddTheme(safeTheme)
+        end
+    end)
+
+    pcall(function()
+        if WindUI then
+            if type(WindUI.Themes) ~= "table" then
+                WindUI.Themes = {}
+            end
+
+            WindUI.Themes[themeName] = windUIFillThemeMissing(WindUI.Themes[themeName] or {}, safeTheme)
+            WindUI.Themes.Dark = windUIFillThemeMissing(WindUI.Themes.Dark or {}, windUIBuildSafeTheme("Dark"))
+
+            if type(WindUI.CurrentTheme) == "table" then
+                WindUI.CurrentTheme = windUIFillThemeMissing(WindUI.CurrentTheme, safeTheme)
+            end
+
+            if type(WindUI.Theme) == "table" then
+                WindUI.Theme = windUIFillThemeMissing(WindUI.Theme, safeTheme)
+            end
+
+            if type(WindUI.Colors) == "table" then
+                WindUI.Colors = windUIFillThemeMissing(WindUI.Colors, safeTheme)
+            end
+        end
+    end)
+
+    pcall(function()
+        if WindUI and WindUI.SetTheme then
+            WindUI:SetTheme(themeName)
+        end
+    end)
+
+    return themeName
+end
+
+function windUICreateWindowSafe(config, label)
+    config = type(config) == "table" and config or {}
+    label = tostring(label or "WindUI Window")
+
+    local themeName = windUIEnsureTheme(config.Theme or (uiSettings and uiSettings.theme) or "Dark")
+    config.Theme = themeName
+
+    local ok, result = pcall(function()
+        return WindUI:CreateWindow(config)
+    end)
+
+    if ok and result then
+        return result, nil
+    end
+
+    warn("
